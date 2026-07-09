@@ -29,8 +29,20 @@ UA = "Mozilla/5.0 (baeumteo-collector)"
 TIMEOUT = 40
 
 
+import re
+
+# XML 1.0 비허용 제어문자 (tab/LF/CR 제외)
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# 엔티티로 이스케이프되지 않은 & (일부 기관 응답에 섞임 → 파싱 실패 유발)
+_AMP_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);)")
+
+
+def _sanitize(text):
+    return _AMP_RE.sub("&amp;", _CTRL_RE.sub("", text))
+
+
 def fetch_xml(base_url, params):
-    """OpenAPI 호출 후 XML 루트 반환(실패 시 None)."""
+    """OpenAPI 호출 후 XML 루트 반환. 깨진 토큰은 정제 후 재파싱(실패 시 None)."""
     qs = urllib.parse.urlencode({**params, "serviceKey": KEY})
     url = f"{base_url}?{qs}"
     req = urllib.request.Request(url, headers={"User-Agent": UA})
@@ -38,9 +50,15 @@ def fetch_xml(base_url, params):
         raw = resp.read().decode("utf-8", "replace")
     try:
         return ET.fromstring(raw)
-    except ET.ParseError as e:
-        print(f"  XML 파싱 실패: {e} / 응답 앞부분: {raw[:120]}", file=sys.stderr)
-        return None
+    except ET.ParseError:
+        # 제어문자/비이스케이프 & 정제 후 재시도 (특정 강좌 설명에 섞여 있음)
+        try:
+            root = ET.fromstring(_sanitize(raw))
+            print("  (정제 후 재파싱 성공)", file=sys.stderr)
+            return root
+        except ET.ParseError as e:
+            print(f"  XML 파싱 실패(정제 후에도): {e}", file=sys.stderr)
+            return None
 
 
 def norm_date(s):
@@ -83,6 +101,12 @@ def collect_seoul():
         if not items:
             break
         for it in items:
+            lecture_id = txt(it, "lectureId")
+            detail_url = (
+                "https://everlearning.sen.go.kr/EVER_Lecture/chairInformation.do"
+                f"?PARENT_SEQ=2&pcd=00&tab_gubun=2&attendAmount=non&lecture_id={lecture_id}"
+                if lecture_id else "https://everlearning.sen.go.kr/chair/chairSearch1.jsp"
+            )
             course = {
                 "lctreNm": txt(it, "lectureNm"),
                 "lctreCo": txt(it, "categoryNm"),
@@ -97,7 +121,7 @@ def collect_seoul():
                 "operInstitutionNm": txt(it, "organNm"),
                 "edcRdnmadr": " ".join(x for x in ["서울특별시", txt(it, "sigunguNm"), txt(it, "place")] if x),
                 "operPhoneNumber": txt(it, "organTelNo"),
-                "homepageUrl": "https://everlearning.sen.go.kr/",
+                "homepageUrl": detail_url,
                 "insttNm": txt(it, "organNm"),
                 "referenceDate": TODAY.isoformat(),
             }
@@ -152,17 +176,30 @@ def collect_daegu():
     return out
 
 
+# ── 소스 레지스트리 ───────────────────────────────────────
+# 지역/기관 추가 = 여기에 (표시이름, 수집함수) 한 줄. 수집함수는 표준필드 dict 리스트 반환.
+SOURCES = [
+    ("seoul_everlearning", collect_seoul),
+    ("daegu", collect_daegu),
+]
+
+
 def main():
     print(f"[{TODAY}] 수집 시작...")
-    seoul = collect_seoul()
-    print(f"  서울교육청 에버러닝: {len(seoul)}건 (접수 가능)")
-    daegu = collect_daegu()
-    print(f"  대구 평생학습포털: {len(daegu)}건 (접수 가능)")
+    all_courses, stats = [], {}
+    for name, fn in SOURCES:
+        try:
+            got = fn()
+        except Exception as e:  # 한 소스가 실패해도 나머지는 계속
+            print(f"  [{name}] 수집 실패: {e}", file=sys.stderr)
+            got = []
+        stats[name] = len(got)
+        all_courses.extend(got)
+        print(f"  {name}: {len(got)}건 (접수 가능)")
 
-    courses = seoul + daegu
     # 중복 제거 (강좌명|운영기관|접수시작 = 앱 stableId 기준)
     seen, deduped = set(), []
-    for c in courses:
+    for c in all_courses:
         key = f"{c['lctreNm']}|{c['operInstitutionNm']}|{c['rceptStartDate']}"
         if key not in seen:
             seen.add(key)
@@ -171,7 +208,7 @@ def main():
     payload = {
         "generatedAt": datetime.datetime.now().isoformat(timespec="seconds"),
         "count": len(deduped),
-        "sources": {"seoul_everlearning": len(seoul), "daegu": len(daegu)},
+        "sources": stats,
         "courses": deduped,
     }
     os.makedirs("data", exist_ok=True)
